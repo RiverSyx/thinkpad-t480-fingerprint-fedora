@@ -1,132 +1,124 @@
-THINKPAD T480 FINGERPRINT SCANNER SETUP - FEDORA
-========================================================
+# ThinkPad T480 Fingerprint Reader on Fedora
 
-STEP 1 - INSTALL PACKAGES
---------------------------
-sudo dnf copr enable sneexy/python-validity
-sudo dnf install open-fprintd fprintd-clients fprintd-clients-pam python3-validity
+A straightforward guide to getting the Validity (`06cb:009a`) fingerprint sensor working reliably on Lenovo ThinkPad T480 laptops running Fedora Linux.
 
+Fixes common issues: `Failed: 0401`, `NoSuchDevice`, `Resource busy`, and sensor failure after suspend.
 
-STEP 2 - DISABLE PREDESKTOP AUTHENTICATION IN BIOS (CRITICAL)
---------------------------------------------------------------
-- Shut down completely
-- Press F1 at the Lenovo logo to enter BIOS
-- Go to Security -> Fingerprint
-- Set "Predesktop Authentication" to Disabled
-- Save with F10 and boot back in
+---
 
-NOTE: Skipping this step will cause the service to crash with
-"Exception: Failed: 0401" and nothing will work.
+## ⚠️ Step 0: BIOS Prerequisite (Required)
 
+Before running commands in Linux, disable **Predesktop Authentication** in BIOS. If left enabled, the firmware claims the sensor at boot and causes `Exception: Failed: 0401`.
 
-STEP 3 - CREATE RUNTIME DIRECTORY AND DOWNLOAD FIRMWARE
---------------------------------------------------------
+1. Shut down completely.
+2. Turn on and press **F1** at the Lenovo logo to enter BIOS.
+3. Navigate to **Security** → **Fingerprint**.
+4. Set **Predesktop Authentication** to **Disabled**.
+5. Press **F10** to save and exit.
+
+---
+
+## Installation
+
+### 1. Install Driver Packages
+Enable the COPR repository for `python-validity` and install the required components:
+
+```bash
+sudo dnf copr enable -y sneexy/python-validity
+sudo dnf install -y open-fprintd fprintd-clients fprintd-clients-pam python3-validity
+```
+
+### 2. Download Firmware & Ensure Persistence
+Create the runtime directory, download the sensor firmware, and ensure `/var/run/python-validity` persists across reboots:
+
+```bash
 sudo mkdir -p /var/run/python-validity
 sudo validity-sensors-firmware
 sudo cp /var/run/python-validity/*.xpfwext /usr/share/python-validity/
-
-
-STEP 4 - MAKE RUNTIME DIRECTORY PERSIST ACROSS REBOOTS
--------------------------------------------------------
 echo 'd /var/run/python-validity 0755 root root -' | sudo tee /etc/tmpfiles.d/python-validity.conf
+```
 
+### 3. Factory Reset the Sensor
+Mask the service first so systemd doesn't claim the USB device while resetting:
 
-STEP 5 - FACTORY RESET THE SENSOR
------------------------------------
+```bash
 sudo systemctl mask python3-validity
 sudo systemctl stop python3-validity
 sudo pkill -9 -f dbus-service
 sudo python3 /usr/share/python-validity/playground/factory-reset.py
+```
+> **Note:** A successful reset produces no output. Any traceback indicates failure (see Troubleshooting below).
 
-NOTE: Masking the service before factory reset is critical — if systemd
-restarts it in the background it will grab the USB device and the reset
-will fail with "Resource busy".
+### 4. Enable Services & Configure Startup Order
+Create a systemd override so `open-fprintd` always waits for `python3-validity` to finish initializing:
 
-A successful factory reset prints nothing. Any traceback means it failed.
-
-
-STEP 6 - START AND ENABLE SERVICES
-------------------------------------
-sudo systemctl unmask python3-validity
-sudo systemctl enable python3-validity
-sudo systemctl start python3-validity
-sudo systemctl add-wants multi-user.target open-fprintd.service
-sleep 8
-sudo systemctl start open-fprintd
-
-
-STEP 7 - FIX SERVICE ORDERING
-------------------------------
-Ensures open-fprintd always waits for python3-validity to fully initialize:
-
+```bash
 sudo mkdir -p /etc/systemd/system/open-fprintd.service.d
-sudo tee /etc/systemd/system/open-fprintd.service.d/after-validity.conf << EOF
+sudo tee /etc/systemd/system/open-fprintd.service.d/after-validity.conf << 'EOF'
 [Unit]
 After=python3-validity.service
 Requires=python3-validity.service
 EOF
+
 sudo systemctl daemon-reload
+sudo systemctl unmask python3-validity
+sudo systemctl enable --now python3-validity
+sudo systemctl add-wants multi-user.target open-fprintd.service
+sleep 5
+sudo systemctl restart open-fprintd
+```
 
+### 5. Fix Suspend & Resume
+Add a systemd sleep hook so the sensor restarts properly after waking from sleep:
 
-STEP 8 - ENROLL YOUR FINGERPRINT
-----------------------------------
-fprintd-enroll
-
-Follow the prompts and swipe your finger several times.
-
-
-STEP 9 - ENABLE FINGERPRINT FOR SUDO AND LOGIN
-------------------------------------------------
-sudo authselect enable-feature with-fingerprint
-sudo authselect apply-changes
-
-Test it:
-sudo echo "works"
-
-
-STEP 10 - FIX FINGERPRINT AFTER SUSPEND/RESUME
-------------------------------------------------
-sudo tee /usr/lib/systemd/system-sleep/fprint_wakeup << EOF
+```bash
+sudo tee /usr/lib/systemd/system-sleep/fprint_wakeup << 'EOF'
 #!/bin/bash
-if [ "\${1}" = "post" ]; then
+if [ "$1" = "post" ]; then
     systemctl restart python3-validity
     systemctl restart open-fprintd
 fi
 EOF
 sudo chmod +x /usr/lib/systemd/system-sleep/fprint_wakeup
+```
 
+---
 
-STEP 11 - OPTIONAL: INCREASE SUDO TIMEOUT
-------------------------------------------
-sudo visudo
+## Enrollment & Usage
 
-Add this line:
-    Defaults timestamp_timeout=60
+### 1. Enroll Your Fingerprint
+Run the enrollment tool and swipe your finger when prompted:
 
-Value is in minutes. Use -1 to never ask again (not recommended).
+```bash
+fprintd-enroll
+```
 
+### 2. Enable Fingerprint Authentication for PAM (Login & Sudo)
+Use Fedora's `authselect` tool to enable PAM fingerprint support:
 
-TROUBLESHOOTING
----------------
-Problem:  validity-sensors-firmware fails with "Is a directory" error
-Fix:      sudo mkdir -p /var/run/python-validity
+```bash
+sudo authselect enable-feature with-fingerprint
+sudo authselect apply-changes
+```
 
-Problem:  factory-reset.py fails with "Resource busy"
-Fix:      sudo systemctl mask python3-validity
-          sudo systemctl stop python3-validity
-          sudo pkill -9 -f dbus-service
-          Then retry factory reset.
+Test it in a new terminal:
+```bash
+sudo echo "Fingerprint working!"
+```
 
-Problem:  factory-reset.py fails with "Exception: Failed: 0401" or "0404"
-Fix:      Disable Predesktop Authentication in BIOS (Step 2).
-          Then do a full shutdown (not reboot), wait 15 seconds, power on,
-          and retry the factory reset before starting any services.
+*(Optional)* To increase the sudo password timeout so you don't have to scan your finger constantly, run `sudo visudo` and add:
+```text
+Defaults timestamp_timeout=60
+```
 
-Problem:  fprintd-enroll returns "NoSuchDevice"
-Fix:      python3-validity probably hasn't finished initializing.
-          Check: journalctl -u python3-validity -n 20 --no-pager
-          Look for "Manager is back online, registering"
-          Then: sudo systemctl restart open-fprintd
+---
 
-Problem:  Fingerprint stops working after suspend
-Fix:      Make sure Step 10 (fprint_wakeup script) is in place.
+## Troubleshooting
+
+| Problem | Cause | Solution |
+| :--- | :--- | :--- |
+| `validity-sensors-firmware: Is a directory` | Missing runtime directory | `sudo mkdir -p /var/run/python-validity` |
+| `factory-reset.py: Resource busy` | Service is locking the USB device | Run `sudo systemctl mask python3-validity && sudo pkill -9 -f dbus-service` and retry. |
+| `factory-reset.py: Exception: Failed: 0401` or `0404` | BIOS Predesktop Auth enabled | Disable Predesktop Auth in BIOS (Step 0). Do a cold shutdown (wait 15s before powering on). |
+| `fprintd-enroll: NoSuchDevice` | Driver still initializing | Run `journalctl -u python3-validity -n 20`. Once it shows `Manager is back online`, run `sudo systemctl restart open-fprintd`. |
+| Fingerprint stops working after suspend | Sleep hook missing or not executable | Ensure the hook in Step 5 (`/usr/lib/systemd/system-sleep/fprint_wakeup`) exists and has `chmod +x`. |
